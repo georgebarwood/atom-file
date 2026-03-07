@@ -1,0 +1,23 @@
+[package]
+name = "atom-file"
+version = "0.1.0"
+edition = "2024"
+authors = ["George Barwood"]
+description = "Buffered concurrent access to files with async atomic commit"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/georgebarwood/atom-file/"
+categories = ["database-implementations"]
+include = ["/src"]
+
+[dependencies]
+rustc-hash = "1.1.0"
+pstd = { version = "0.1.0", optional=true }
+
+[features]
+default = []
+unsafe-optim = ["pstd/unsafe-optim"]
+log = []
+pstd = ["dep:pstd"]
+
+[dev-dependencies]
+rand = "0.8.4"

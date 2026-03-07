@@ -26,6 +26,10 @@ pub type Data = Arc<Vec<u8>>;
 /// af.commit(4);
 /// af.wait_complete();
 /// ```
+///
+/// Atomic file has two maps of writes. On commit, the latest batch of writes are sent to be written to underlying 
+/// storage, and are also applied to the second map in the "CommitFile". The CommitFile map is reset when all
+/// the updates to underlying storage have been applied.
 pub struct AtomicFile {
     map: WMap,
     cf: Arc<RwLock<CommitFile>>,
@@ -379,7 +383,7 @@ pub struct Limits {
     pub map_lim: usize,
     /// Memory for buffering small reads, default is 0x200000.
     pub rbuf_mem: usize,
-    /// Memory for buffering writes to main storage,, default is 0x100000.
+    /// Memory for buffering writes to main storage, default is 0x100000.
     pub swbuf: usize,
     /// Memory for buffering writes to temporary storage, default is 0x100000.
     pub uwbuf: usize,
@@ -991,6 +995,7 @@ fn test_atomic_file() {
     /* Idea of test is to check AtomicFile and MemFile behave the same */
 
     let ta = test_amount();
+    println!(" Test amount={}", ta);
 
     let mut rng = rand::thread_rng();
 
@@ -1019,5 +1024,7 @@ fn test_atomic_file() {
                 assert!(b2 == b3);
             }
         }
+        s1.commit(200);
+        s2.commit(200);
     }
 }

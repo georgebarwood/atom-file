@@ -2,14 +2,14 @@
 //!
 //! [`BasicAtomicFile`] is a non-async alternative.
 
-#[cfg(feature = "pstd")]
-use pstd::collections::BTreeMap;
-use rustc_hash::FxHashMap as HashMap;
 use std::cmp::min;
 use std::sync::{Arc, Mutex, RwLock};
+use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(not(feature = "pstd"))]
 use std::collections::BTreeMap;
+#[cfg(feature = "pstd")]
+use pstd::collections::BTreeMap;
 
 /// ```Arc<Vec<u8>>```
 pub type Data = Arc<Vec<u8>>;
@@ -381,11 +381,11 @@ impl Storage for DummyFile {
 pub struct Limits {
     /// Limit on size of commit write map, default is 5000.
     pub map_lim: usize,
-    /// Memory for buffering small reads, default is 0x200000.
+    /// Memory for buffering small reads, default is 0x200000 ( 2MB ).
     pub rbuf_mem: usize,
-    /// Memory for buffering writes to main storage, default is 0x100000.
+    /// Memory for buffering writes to main storage, default is 0x100000 (1MB).
     pub swbuf: usize,
-    /// Memory for buffering writes to temporary storage, default is 0x100000.
+    /// Memory for buffering writes to temporary storage, default is 0x100000 (1MB).
     pub uwbuf: usize,
 }
 
@@ -688,6 +688,7 @@ impl DataSlice {
         self.len -= trim;
     }
     /// Take the data.
+    #[allow(dead_code)]
     pub fn take(&mut self) -> Data {
         std::mem::take(&mut self.data)
     }
@@ -851,7 +852,7 @@ impl WMap {
     }
 }
 
-/// Basis for [crate::AtomicFile] ( non-async alternative ). Provides two-phase commit and buffering of reads and writes.
+/// Basis for [crate::AtomicFile] ( non-async alternative ). Provides two-phase commit and buffering of writes.
 pub struct BasicAtomicFile {
     /// The main underlying storage.
     stg: WriteBuffer,

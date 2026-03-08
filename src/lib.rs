@@ -2,14 +2,14 @@
 //!
 //! [`BasicAtomicFile`] is a non-async alternative.
 
+use rustc_hash::FxHashMap as HashMap;
 use std::cmp::min;
 use std::sync::{Arc, Mutex, RwLock};
-use rustc_hash::FxHashMap as HashMap;
 
-#[cfg(not(feature = "pstd"))]
-use std::collections::BTreeMap;
 #[cfg(feature = "pstd")]
 use pstd::collections::BTreeMap;
+#[cfg(not(feature = "pstd"))]
+use std::collections::BTreeMap;
 
 /// ```Arc<Vec<u8>>```
 pub type Data = Arc<Vec<u8>>;
@@ -27,15 +27,21 @@ pub type Data = Arc<Vec<u8>>;
 /// af.wait_complete();
 /// ```
 ///
-/// Atomic file has two maps of writes. On commit, the latest batch of writes are sent to be written to underlying 
+/// Atomic file has two maps of writes. On commit, the latest batch of writes are sent to be written to underlying
 /// storage, and are also applied to the second map in the "CommitFile". The CommitFile map is reset when all
 /// the updates to underlying storage have been applied.
 pub struct AtomicFile {
+    /// New updates are written here.
     map: WMap,
+    /// Underlying file, with previous updates mapped.
     cf: Arc<RwLock<CommitFile>>,
+    /// File size.
     size: u64,
+    /// For sending update maps to be saved.
     tx: std::sync::mpsc::Sender<(u64, WMap)>,
+    /// Held by update process while it is active.
     busy: Arc<Mutex<()>>,
+    /// Limit on size of CommitFile map.
     map_lim: usize,
 }
 
@@ -60,6 +66,7 @@ impl AtomicFile {
         // Start the thread which does save asyncronously.
         let (cf1, busy1) = (cf.clone(), busy.clone());
         std::thread::spawn(move || {
+            // Loop that recieves a map of updates and applies it to BasicAtomicFile.
             while let Ok((size, map)) = rx.recv() {
                 let _lock = busy1.lock();
                 baf.map = map;
@@ -90,7 +97,9 @@ impl Storage for AtomicFile {
         let map = std::mem::take(&mut self.map);
         let cf = &mut *self.cf.write().unwrap();
         cf.todo += 1;
+        // Apply map of updates to CommitFile.
         map.to_storage(cf);
+        // Send map of updates to thread to be written to underlying storage.
         self.tx.send((size, map)).unwrap();
     }
 
@@ -114,8 +123,6 @@ impl Storage for AtomicFile {
 
     fn wait_complete(&self) {
         while self.cf.read().unwrap().todo != 0 {
-            #[cfg(feature = "log")]
-            println!("AtomicFile::wait_complete - waiting for writer process");
             let _x = self.busy.lock();
         }
     }
@@ -401,8 +408,11 @@ impl Default for Limits {
 }
 
 struct CommitFile {
+    /// Buffered underlying storage.
     stg: ReadBufStg<256>,
+    /// Map of committed updates.
     map: WMap,
+    /// Number of outstanding unsaved commits.
     todo: usize,
 }
 
@@ -448,21 +458,14 @@ impl Storage for CommitFile {
 
 /// Write Buffer.
 struct WriteBuffer {
+    /// Current write index into buf.
     ix: usize,
+    /// Current file position.
     pos: u64,
     /// Underlying storage.
     pub stg: Box<dyn Storage>,
+    /// Buffer.
     buf: Vec<u8>,
-    #[cfg(feature = "log")]
-    log: Log,
-}
-
-#[cfg(feature = "log")]
-struct Log {
-    write: u64,
-    flush: u64,
-    total: u64,
-    first_flush_time: std::time::Instant,
 }
 
 impl WriteBuffer {
@@ -473,13 +476,6 @@ impl WriteBuffer {
             pos: u64::MAX,
             stg,
             buf: vec![0; buf_size],
-            #[cfg(feature = "log")]
-            log: Log {
-                write: 0,
-                flush: 0,
-                total: 0,
-                first_flush_time: std::time::Instant::now(),
-            },
         }
     }
 
@@ -490,11 +486,6 @@ impl WriteBuffer {
         }
         let mut done: usize = 0;
         let mut todo: usize = data.len();
-        #[cfg(feature = "log")]
-        {
-            self.log.write += 1;
-            self.log.total += todo as u64;
-        }
         while todo > 0 {
             let mut n: usize = self.buf.len() - self.ix;
             if n == 0 {
@@ -514,13 +505,6 @@ impl WriteBuffer {
     fn flush(&mut self, new_pos: u64) {
         if self.ix > 0 {
             self.stg.write(self.pos, &self.buf[0..self.ix]);
-            #[cfg(feature = "log")]
-            {
-                if self.log.flush == 0 {
-                    self.log.first_flush_time = std::time::Instant::now();
-                }
-                self.log.flush += 1;
-            }
         }
         self.ix = 0;
         self.pos = new_pos;
@@ -530,21 +514,6 @@ impl WriteBuffer {
     pub fn commit(&mut self, size: u64) {
         self.flush(u64::MAX);
         self.stg.commit(size);
-        #[cfg(feature = "log")]
-        {
-            if size > 0 {
-                println!(
-                    "WriteBuffer commit size={size} write={} flush={} total={} time(micros)={}",
-                    self.log.write,
-                    self.log.flush,
-                    self.log.total,
-                    self.log.first_flush_time.elapsed().as_micros()
-                );
-            }
-            self.log.write = 0;
-            self.log.flush = 0;
-            self.log.total = 0;
-        }
     }
 
     /// Write u64.
@@ -559,8 +528,11 @@ impl WriteBuffer {
 ///
 /// N is buffer size.
 struct ReadBufStg<const N: usize> {
+    /// Underlying storage.
     stg: Box<dyn Storage>,
+    /// Buffers.
     buf: Mutex<ReadBuffer<N>>,
+    /// Read size that is considered small.
     limit: usize,
 }
 
@@ -613,9 +585,10 @@ impl<const N: usize> Storage for ReadBufStg<N> {
 }
 
 struct ReadBuffer<const N: usize> {
+    /// Maps sector mumbers cached buffers.
     map: HashMap<u64, Box<[u8; N]>>,
+    /// Maximum number of buffers.
     max_buf: usize,
-    reads: u64,
 }
 
 impl<const N: usize> ReadBuffer<N> {
@@ -623,18 +596,10 @@ impl<const N: usize> ReadBuffer<N> {
         Self {
             map: HashMap::default(),
             max_buf,
-            reads: 0,
         }
     }
 
     fn reset(&mut self) {
-        #[cfg(feature = "log")]
-        println!(
-            "ReadBuffer reset entries={} reads={}",
-            self.map.len(),
-            self.reads
-        );
-        self.reads = 0;
         self.map.clear();
     }
 
@@ -645,8 +610,6 @@ impl<const N: usize> ReadBuffer<N> {
             let sector = off / N as u64;
             let disp = (off % N as u64) as usize;
             let amount = min(data.len() - done, N - disp);
-
-            self.reads += 1;
 
             let p = self.map.entry(sector).or_insert_with(|| {
                 let mut p: Box<[u8; N]> = vec![0; N].try_into().unwrap();

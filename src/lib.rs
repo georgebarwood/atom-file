@@ -2,6 +2,8 @@
 //!
 //! [`BasicAtomicFile`] is a non-async alternative.
 
+#![deny(missing_docs)]
+
 use rustc_hash::FxHashMap as HashMap;
 use std::cmp::min;
 use std::sync::{Arc, Mutex, RwLock};
@@ -128,6 +130,55 @@ impl Storage for AtomicFile {
     }
 }
 
+struct CommitFile {
+    /// Buffered underlying storage.
+    stg: ReadBufStg<256>,
+    /// Map of committed updates.
+    map: WMap,
+    /// Number of outstanding unsaved commits.
+    todo: usize,
+}
+
+impl CommitFile {
+    fn new(stg: Box<dyn Storage>, buf_mem: usize) -> Self {
+        Self {
+            stg: ReadBufStg::<256>::new(stg, 50, buf_mem / 256),
+            map: WMap::default(),
+            todo: 0,
+        }
+    }
+
+    fn done_one(&mut self) {
+        self.todo -= 1;
+        if self.todo == 0 {
+            self.map = WMap::default();
+            self.stg.reset();
+        }
+    }
+}
+
+impl Storage for CommitFile {
+    fn commit(&mut self, _size: u64) {
+        panic!()
+    }
+
+    fn size(&self) -> u64 {
+        panic!()
+    }
+
+    fn read(&self, start: u64, data: &mut [u8]) {
+        self.map.read(start, data, &self.stg);
+    }
+
+    fn write_data(&mut self, start: u64, data: Data, off: usize, len: usize) {
+        self.map.write(start, data, off, len);
+    }
+
+    fn write(&mut self, _start: u64, _data: &[u8]) {
+        panic!()
+    }
+}
+
 /// Storage interface - Storage is some kind of "file" storage.
 ///
 /// read and write methods take a start which is a byte offset in the underlying file.
@@ -178,7 +229,7 @@ pub trait Storage: Send + Sync {
     fn wait_complete(&self) {}
 }
 
-/// Simple implementation of [Storage] using `Vec<u8>`.
+/// Simple implementation of [Storage] using `Arc<Mutex<Vec<u8>>`.
 #[derive(Default)]
 pub struct MemFile {
     v: Arc<Mutex<Vec<u8>>>,
@@ -187,7 +238,7 @@ pub struct MemFile {
 impl MemFile {
     /// Get a new (boxed) MemFile.
     pub fn new() -> Box<Self> {
-        Box::<Self>::default()
+        Box::default()
     }
 }
 
@@ -229,64 +280,81 @@ impl Storage for MemFile {
 
 use std::{fs, fs::OpenOptions, io::Read, io::Seek, io::SeekFrom, io::Write};
 
-/// Simple implementation of [Storage] using `std::fs::File`.
+struct SimpleFileStorageInner {
+    f: fs::File,
+}
+
+impl SimpleFileStorageInner {
+    /// Construct from filename.
+    pub fn new(filename: &str) -> Self {
+        Self {
+            f: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(filename)
+                .unwrap(),
+        }
+    }
+
+    fn size(&mut self) -> u64 {
+        self.f.seek(SeekFrom::End(0)).unwrap()
+    }
+
+    fn read(&mut self, off: u64, bytes: &mut [u8]) {
+        self.f.seek(SeekFrom::Start(off)).unwrap();
+        let _ = self.f.read(bytes).unwrap();
+    }
+
+    fn write(&mut self, off: u64, bytes: &[u8]) {
+        // The list of operating systems which auto-zero is likely more than this...research is todo.
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let size = self.f.seek(SeekFrom::End(0)).unwrap();
+            if off > size {
+                self.f.set_len(off).unwrap();
+            }
+        }
+        self.f.seek(SeekFrom::Start(off)).unwrap();
+        let _ = self.f.write(bytes).unwrap();
+    }
+
+    fn commit(&mut self, size: u64) {
+        self.f.set_len(size).unwrap();
+        self.f.sync_all().unwrap();
+    }
+}
+
+/// Simple implementation of [Storage] using [`std::fs::File`].
 pub struct SimpleFileStorage {
-    file: Arc<Mutex<fs::File>>,
+    file: Arc<Mutex<SimpleFileStorageInner>>,
 }
 
 impl SimpleFileStorage {
     /// Construct from filename.
     pub fn new(filename: &str) -> Box<Self> {
         Box::new(Self {
-            file: Arc::new(Mutex::new(
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(filename)
-                    .unwrap(),
-            )),
+            file: Arc::new(Mutex::new(SimpleFileStorageInner::new(filename))),
         })
     }
 }
 
 impl Storage for SimpleFileStorage {
     fn size(&self) -> u64 {
-        let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::End(0)).unwrap()
+        self.file.lock().unwrap().size()
     }
 
     fn read(&self, off: u64, bytes: &mut [u8]) {
-        let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(off)).unwrap();
-        let _ = f.read(bytes).unwrap();
+        self.file.lock().unwrap().read(off, bytes);
     }
 
     fn write(&mut self, off: u64, bytes: &[u8]) {
-        let mut f = self.file.lock().unwrap();
-        // The list of operating systems which auto-zero is likely more than this...research is todo.
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        {
-            let size = f.seek(SeekFrom::End(0)).unwrap();
-            if off > size {
-                f.set_len(off).unwrap();
-                /*
-                let len = (off - size) as usize;
-                let zb = vec![0; len];
-                f.seek(SeekFrom::Start(size)).unwrap();
-                let _ = f.write(&zb).unwrap();
-                */
-            }
-        }
-        f.seek(SeekFrom::Start(off)).unwrap();
-        let _ = f.write(bytes).unwrap();
+        self.file.lock().unwrap().write(off, bytes);
     }
 
     fn commit(&mut self, size: u64) {
-        let f = self.file.lock().unwrap();
-        f.set_len(size).unwrap();
-        f.sync_all().unwrap();
+        self.file.lock().unwrap().commit(size);
     }
 
     fn clone(&self) -> Box<dyn Storage> {
@@ -296,44 +364,44 @@ impl Storage for SimpleFileStorage {
     }
 }
 
-/// Alternative to SimpleFileStorage that uses multiple [SimpleFileStorage]s to allow parallel reads/writes by different threads.
+/// Alternative to SimpleFileStorage that uses multiple [SimpleFileStorage]s to allow parallel reads by different threads.
 #[allow(clippy::vec_box)]
 pub struct MultiFileStorage {
     filename: String,
-    files: Arc<Mutex<Vec<Box<SimpleFileStorage>>>>,
+    files: Arc<Mutex<Vec<Box<SimpleFileStorageInner>>>>,
 }
 
 impl MultiFileStorage {
     /// Create new MultiFileStorage.
     pub fn new(filename: &str) -> Box<Self> {
         Box::new(Self {
-            filename: filename.to_string(),
+            filename: filename.to_owned(),
             files: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
-    fn get_file(&self) -> Box<SimpleFileStorage> {
+    fn get_file(&self) -> Box<SimpleFileStorageInner> {
         match self.files.lock().unwrap().pop() {
             Some(f) => f,
-            _ => SimpleFileStorage::new(&self.filename),
+            _ => Box::new(SimpleFileStorageInner::new(&self.filename)),
         }
     }
 
-    fn put_file(&self, f: Box<SimpleFileStorage>) {
+    fn put_file(&self, f: Box<SimpleFileStorageInner>) {
         self.files.lock().unwrap().push(f);
     }
 }
 
 impl Storage for MultiFileStorage {
     fn size(&self) -> u64 {
-        let f = self.get_file();
+        let mut f = self.get_file();
         let result = f.size();
         self.put_file(f);
         result
     }
 
     fn read(&self, off: u64, bytes: &mut [u8]) {
-        let f = self.get_file();
+        let mut f = self.get_file();
         f.read(off, bytes);
         self.put_file(f);
     }
@@ -404,55 +472,6 @@ impl Default for Limits {
             swbuf: 0x100000,
             uwbuf: 0x100000,
         }
-    }
-}
-
-struct CommitFile {
-    /// Buffered underlying storage.
-    stg: ReadBufStg<256>,
-    /// Map of committed updates.
-    map: WMap,
-    /// Number of outstanding unsaved commits.
-    todo: usize,
-}
-
-impl CommitFile {
-    fn new(stg: Box<dyn Storage>, buf_mem: usize) -> Self {
-        Self {
-            stg: ReadBufStg::<256>::new(stg, 50, buf_mem / 256),
-            map: WMap::default(),
-            todo: 0,
-        }
-    }
-
-    fn done_one(&mut self) {
-        self.todo -= 1;
-        if self.todo == 0 {
-            self.map = WMap::default();
-            self.stg.reset();
-        }
-    }
-}
-
-impl Storage for CommitFile {
-    fn commit(&mut self, _size: u64) {
-        panic!()
-    }
-
-    fn size(&self) -> u64 {
-        panic!()
-    }
-
-    fn read(&self, start: u64, data: &mut [u8]) {
-        self.map.read(start, data, &self.stg);
-    }
-
-    fn write_data(&mut self, start: u64, data: Data, off: usize, len: usize) {
-        self.map.write(start, data, off, len);
-    }
-
-    fn write(&mut self, _start: u64, _data: &[u8]) {
-        panic!()
     }
 }
 
@@ -658,7 +677,7 @@ impl DataSlice {
 }
 
 #[derive(Default)]
-/// Updateable storage based on some underlying storage.
+/// Updateable store based on some underlying storage.
 struct WMap {
     /// Map of writes. Key is the end of the slice.
     map: BTreeMap<u64, DataSlice>,
@@ -965,6 +984,7 @@ fn test_atomic_file() {
 
     for _ in 0..100 {
         let mut s1 = AtomicFile::new(MemFile::new(), MemFile::new());
+        // let mut s1 = BasicAtomicFile::new(MemFile::new(), MemFile::new(), &Limits::default() );
         let mut s2 = MemFile::new();
 
         for _ in 0..1000 * ta {
@@ -987,8 +1007,10 @@ fn test_atomic_file() {
                 s2.read(off as u64, &mut b3);
                 assert!(b2 == b3);
             }
+            if rng.r#gen::<usize>() % 50 == 0 {
+                s1.commit(200);
+                s2.commit(200);
+            }
         }
-        s1.commit(200);
-        s2.commit(200);
     }
 }

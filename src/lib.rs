@@ -22,7 +22,7 @@ pub type Data = Arc<Vec<u8>>;
 /// #Example
 ///
 /// ```
-/// use atom_file::{AtomicFile,DummyFile,MemFile,Storage};
+/// use atom_file::{AtomicFile,DummyFile,MemFile,BasicStorage};
 /// let mut af = AtomicFile::new(MemFile::new(), DummyFile::new());
 /// af.write( 0, &[1,2,3,4] );
 /// af.commit(4);
@@ -49,24 +49,26 @@ pub struct AtomicFile {
 
 impl AtomicFile {
     /// Construct AtomicFile with default limits. stg is the main underlying storage, upd is temporary storage for updates during commit.
-    pub fn new(stg: Box<dyn Storage>, upd: Box<dyn Storage>) -> Box<Self> {
+    pub fn new(stg: Box<dyn Storage>, upd: Box<dyn BasicStorage>) -> Box<Self> {
         Self::new_with_limits(stg, upd, &Limits::default())
     }
 
     /// Construct Atomic file with specified limits.
     pub fn new_with_limits(
         stg: Box<dyn Storage>,
-        upd: Box<dyn Storage>,
+        upd: Box<dyn BasicStorage>,
         lim: &Limits,
     ) -> Box<Self> {
         let size = stg.size();
         let mut baf = BasicAtomicFile::new(stg.clone(), upd, lim);
+
         let (tx, rx) = std::sync::mpsc::channel::<(u64, WMap)>();
         let cf = Arc::new(RwLock::new(CommitFile::new(stg, lim.rbuf_mem)));
         let busy = Arc::new(Mutex::new(())); // Lock held while async save thread is active.
 
         // Start the thread which does save asyncronously.
         let (cf1, busy1) = (cf.clone(), busy.clone());
+
         std::thread::spawn(move || {
             // Loop that recieves a map of updates and applies it to BasicAtomicFile.
             while let Ok((size, map)) = rx.recv() {
@@ -87,7 +89,9 @@ impl AtomicFile {
     }
 }
 
-impl Storage for AtomicFile {
+impl Storage for AtomicFile {}
+
+impl BasicStorage for AtomicFile {
     fn commit(&mut self, size: u64) {
         self.size = size;
         if self.map.is_empty() {
@@ -157,7 +161,9 @@ impl CommitFile {
     }
 }
 
-impl Storage for CommitFile {
+impl Storage for CommitFile {}
+
+impl BasicStorage for CommitFile {
     fn commit(&mut self, _size: u64) {
         panic!()
     }
@@ -179,10 +185,10 @@ impl Storage for CommitFile {
     }
 }
 
-/// Storage interface - Storage is some kind of "file" storage.
+/// Storage interface - BasicStorage is some kind of "file" storage.
 ///
 /// read and write methods take a start which is a byte offset in the underlying file.
-pub trait Storage: Send + Sync {
+pub trait BasicStorage: Send {
     /// Get the size of the underlying storage.
     /// Note : this is valid initially and after a commit but is not defined after write is called.
     fn size(&self) -> u64;
@@ -221,13 +227,16 @@ pub trait Storage: Send + Sync {
     }
 
     /// Clone. note: provided method panics.
-    fn clone(&self) -> Box<dyn Storage> {
+    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
         panic!()
     }
 
     /// Wait until current writes are complete.
     fn wait_complete(&self) {}
 }
+
+/// BasicStorage that can be shared between threads.
+pub trait Storage: BasicStorage + Sync {}
 
 /// Simple implementation of [Storage] using `Arc<Mutex<Vec<u8>>`.
 #[derive(Default)]
@@ -242,7 +251,9 @@ impl MemFile {
     }
 }
 
-impl Storage for MemFile {
+impl Storage for MemFile {}
+
+impl BasicStorage for MemFile {
     fn size(&self) -> u64 {
         let v = self.v.lock().unwrap();
         v.len() as u64
@@ -273,18 +284,18 @@ impl Storage for MemFile {
         v.resize(size as usize, 0);
     }
 
-    fn clone(&self) -> Box<dyn Storage> {
+    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
         Box::new(Self { v: self.v.clone() })
     }
 }
 
 use std::{fs, fs::OpenOptions, io::Read, io::Seek, io::SeekFrom, io::Write};
 
-struct SimpleFileStorageInner {
+struct FileInner {
     f: fs::File,
 }
 
-impl SimpleFileStorageInner {
+impl FileInner {
     /// Construct from filename.
     pub fn new(filename: &str) -> Self {
         Self {
@@ -326,21 +337,55 @@ impl SimpleFileStorageInner {
     }
 }
 
+use std::cell::RefCell;
+/// Can be used for atomic upd file ( does not implement Sync ).
+pub struct FastFileStorage {
+    file: Box<RefCell<FileInner>>,
+}
+
+impl FastFileStorage {
+    /// Construct from filename.
+    pub fn new(filename: &str) -> Box<Self> {
+        Box::new(Self {
+            file: Box::new(RefCell::new(FileInner::new(filename))),
+        })
+    }
+}
+
+impl BasicStorage for FastFileStorage {
+    fn size(&self) -> u64 {
+        self.file.borrow_mut().size()
+    }
+    fn read(&self, off: u64, bytes: &mut [u8]) {
+        self.file.borrow_mut().read(off, bytes);
+    }
+
+    fn write(&mut self, off: u64, bytes: &[u8]) {
+        self.file.borrow_mut().write(off, bytes);
+    }
+
+    fn commit(&mut self, size: u64) {
+        self.file.borrow_mut().commit(size);
+    }
+}
+
 /// Simple implementation of [Storage] using [`std::fs::File`].
 pub struct SimpleFileStorage {
-    file: Arc<Mutex<SimpleFileStorageInner>>,
+    file: Arc<Mutex<FileInner>>,
 }
 
 impl SimpleFileStorage {
     /// Construct from filename.
     pub fn new(filename: &str) -> Box<Self> {
         Box::new(Self {
-            file: Arc::new(Mutex::new(SimpleFileStorageInner::new(filename))),
+            file: Arc::new(Mutex::new(FileInner::new(filename))),
         })
     }
 }
 
-impl Storage for SimpleFileStorage {
+impl Storage for SimpleFileStorage {}
+
+impl BasicStorage for SimpleFileStorage {
     fn size(&self) -> u64 {
         self.file.lock().unwrap().size()
     }
@@ -357,7 +402,7 @@ impl Storage for SimpleFileStorage {
         self.file.lock().unwrap().commit(size);
     }
 
-    fn clone(&self) -> Box<dyn Storage> {
+    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
         Box::new(Self {
             file: self.file.clone(),
         })
@@ -368,7 +413,7 @@ impl Storage for SimpleFileStorage {
 #[allow(clippy::vec_box)]
 pub struct MultiFileStorage {
     filename: String,
-    files: Arc<Mutex<Vec<Box<SimpleFileStorageInner>>>>,
+    files: Arc<Mutex<Vec<Box<FileInner>>>>,
 }
 
 impl MultiFileStorage {
@@ -380,19 +425,21 @@ impl MultiFileStorage {
         })
     }
 
-    fn get_file(&self) -> Box<SimpleFileStorageInner> {
+    fn get_file(&self) -> Box<FileInner> {
         match self.files.lock().unwrap().pop() {
             Some(f) => f,
-            _ => Box::new(SimpleFileStorageInner::new(&self.filename)),
+            _ => Box::new(FileInner::new(&self.filename)),
         }
     }
 
-    fn put_file(&self, f: Box<SimpleFileStorageInner>) {
+    fn put_file(&self, f: Box<FileInner>) {
         self.files.lock().unwrap().push(f);
     }
 }
 
-impl Storage for MultiFileStorage {
+impl Storage for MultiFileStorage {}
+
+impl BasicStorage for MultiFileStorage {
     fn size(&self) -> u64 {
         let mut f = self.get_file();
         let result = f.size();
@@ -418,7 +465,7 @@ impl Storage for MultiFileStorage {
         self.put_file(f);
     }
 
-    fn clone(&self) -> Box<dyn Storage> {
+    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
         Box::new(Self {
             filename: self.filename.clone(),
             files: self.files.clone(),
@@ -435,7 +482,9 @@ impl DummyFile {
     }
 }
 
-impl Storage for DummyFile {
+impl Storage for DummyFile {}
+
+impl BasicStorage for DummyFile {
     fn size(&self) -> u64 {
         0
     }
@@ -446,7 +495,7 @@ impl Storage for DummyFile {
 
     fn commit(&mut self, _size: u64) {}
 
-    fn clone(&self) -> Box<dyn Storage> {
+    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
         Self::new()
     }
 }
@@ -482,14 +531,14 @@ struct WriteBuffer {
     /// Current file position.
     pos: u64,
     /// Underlying storage.
-    pub stg: Box<dyn Storage>,
+    pub stg: Box<dyn BasicStorage>,
     /// Buffer.
     buf: Vec<u8>,
 }
 
 impl WriteBuffer {
     /// Construct.
-    pub fn new(stg: Box<dyn Storage>, buf_size: usize) -> Self {
+    pub fn new(stg: Box<dyn BasicStorage>, buf_size: usize) -> Self {
         Self {
             ix: 0,
             pos: u64::MAX,
@@ -577,7 +626,9 @@ impl<const N: usize> ReadBufStg<N> {
     }
 }
 
-impl<const N: usize> Storage for ReadBufStg<N> {
+impl<const N: usize> Storage for ReadBufStg<N> {}
+
+impl<const N: usize> BasicStorage for ReadBufStg<N> {
     /// Read data from storage.
     fn read(&self, start: u64, data: &mut [u8]) {
         if data.len() <= self.limit {
@@ -804,7 +855,7 @@ impl WMap {
     }
 
     /// Read from storage, taking map of existing writes into account. Unwritten ranges are read from underlying storage.
-    pub fn read(&self, start: u64, data: &mut [u8], u: &dyn Storage) {
+    pub fn read(&self, start: u64, data: &mut [u8], u: &dyn BasicStorage) {
         let len = data.len();
         if len != 0 {
             let mut done = 0;
@@ -849,7 +900,7 @@ pub struct BasicAtomicFile {
 
 impl BasicAtomicFile {
     /// stg is the main underlying storage, upd is temporary storage for updates during commit.
-    pub fn new(stg: Box<dyn Storage>, upd: Box<dyn Storage>, lim: &Limits) -> Box<Self> {
+    pub fn new(stg: Box<dyn Storage>, upd: Box<dyn BasicStorage>, lim: &Limits) -> Box<Self> {
         let size = stg.size();
         let mut result = Box::new(Self {
             stg: WriteBuffer::new(stg, lim.swbuf),
@@ -940,7 +991,7 @@ impl BasicAtomicFile {
     }
 }
 
-impl Storage for BasicAtomicFile {
+impl BasicStorage for BasicAtomicFile {
     fn commit(&mut self, size: u64) {
         self.commit_phase(size, 1);
         self.commit_phase(size, 2);

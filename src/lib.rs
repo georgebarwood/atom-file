@@ -162,8 +162,6 @@ impl CommitFile {
     }
 }
 
-impl Storage for CommitFile {}
-
 impl BasicStorage for CommitFile {
     fn commit(&mut self, _size: u64) {
         panic!()
@@ -228,7 +226,7 @@ pub trait BasicStorage: Send {
     }
 
     /// Clone. note: provided method panics.
-    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
+    fn clone(&self) -> Box<dyn Storage> {
         panic!()
     }
 
@@ -285,7 +283,7 @@ impl BasicStorage for MemFile {
         v.resize(size as usize, 0);
     }
 
-    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
+    fn clone(&self) -> Box<dyn Storage> {
         Box::new(Self { v: self.v.clone() })
     }
 }
@@ -402,7 +400,7 @@ impl BasicStorage for SimpleFileStorage {
         self.file.lock().unwrap().commit(size);
     }
 
-    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
+    fn clone(&self) -> Box<dyn Storage> {
         Box::new(Self {
             file: self.file.clone(),
         })
@@ -465,7 +463,7 @@ impl BasicStorage for MultiFileStorage {
         self.put_file(f);
     }
 
-    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
+    fn clone(&self) -> Box<dyn Storage> {
         Box::new(Self {
             filename: self.filename.clone(),
             files: self.files.clone(),
@@ -495,7 +493,7 @@ impl BasicStorage for DummyFile {
 
     fn commit(&mut self, _size: u64) {}
 
-    fn clone(&self) -> Box<dyn Storage + Send + Sync> {
+    fn clone(&self) -> Box<dyn Storage> {
         Self::new()
     }
 }
@@ -626,8 +624,6 @@ impl<const N: usize> ReadBufStg<N> {
     }
 }
 
-impl<const N: usize> Storage for ReadBufStg<N> {}
-
 impl<const N: usize> BasicStorage for ReadBufStg<N> {
     /// Read data from storage.
     fn read(&self, start: u64, data: &mut [u8]) {
@@ -673,7 +669,7 @@ impl<const N: usize> ReadBuffer<N> {
         self.map.clear();
     }
 
-    fn read(&mut self, stg: &dyn Storage, off: u64, data: &mut [u8]) {
+    fn read(&mut self, stg: &dyn BasicStorage, off: u64, data: &mut [u8]) {
         let mut done = 0;
         while done < data.len() {
             let off = off + done as u64;
@@ -757,7 +753,7 @@ impl WMap {
     }
 
     /// Write the map into storage.
-    pub fn to_storage(&self, stg: &mut dyn Storage) {
+    pub fn to_storage(&self, stg: &mut dyn BasicStorage) {
         for (end, v) in self.map.iter() {
             let start = end - v.len as u64;
             stg.write_data(start, v.data.clone(), v.off, v.len);
@@ -900,7 +896,7 @@ pub struct BasicAtomicFile {
 
 impl BasicAtomicFile {
     /// stg is the main underlying storage, upd is temporary storage for updates during commit.
-    pub fn new(stg: Box<dyn Storage>, upd: Box<dyn BasicStorage>, lim: &Limits) -> Box<Self> {
+    pub fn new(stg: Box<dyn BasicStorage>, upd: Box<dyn BasicStorage>, lim: &Limits) -> Box<Self> {
         let size = stg.size();
         let mut result = Box::new(Self {
             stg: WriteBuffer::new(stg, lim.swbuf),

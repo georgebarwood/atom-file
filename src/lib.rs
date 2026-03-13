@@ -7,6 +7,7 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::cmp::min;
 use std::sync::{Arc, Mutex, RwLock};
+use std::cell::RefCell;
 
 #[cfg(feature = "pstd")]
 use pstd::collections::BTreeMap;
@@ -337,17 +338,16 @@ impl FileInner {
     }
 }
 
-use std::cell::RefCell;
 /// Can be used for atomic upd file ( does not implement Sync ).
 pub struct FastFileStorage {
-    file: Box<RefCell<FileInner>>,
+    file: RefCell<FileInner>,
 }
 
 impl FastFileStorage {
     /// Construct from filename.
     pub fn new(filename: &str) -> Box<Self> {
         Box::new(Self {
-            file: Box::new(RefCell::new(FileInner::new(filename))),
+            file: RefCell::new(FileInner::new(filename)),
         })
     }
 }

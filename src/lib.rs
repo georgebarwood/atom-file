@@ -413,7 +413,7 @@ impl BasicStorage for SimpleFileStorage {
 #[allow(clippy::vec_box)]
 pub struct MultiFileStorage {
     filename: String,
-    files: Arc<Mutex<Vec<Box<FileInner>>>>,
+    files: Arc<Mutex<Vec<FileInner>>>,
 }
 
 impl MultiFileStorage {
@@ -425,14 +425,14 @@ impl MultiFileStorage {
         })
     }
 
-    fn get_file(&self) -> Box<FileInner> {
+    fn get_file(&self) -> FileInner {
         match self.files.lock().unwrap().pop() {
             Some(f) => f,
-            _ => Box::new(FileInner::new(&self.filename)),
+            _ => FileInner::new(&self.filename),
         }
     }
 
-    fn put_file(&self, f: Box<FileInner>) {
+    fn put_file(&self, f: FileInner) {
         self.files.lock().unwrap().push(f);
     }
 }

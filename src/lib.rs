@@ -90,7 +90,13 @@ impl AtomicFile {
     }
 }
 
-impl Storage for AtomicFile {}
+impl Storage for AtomicFile
+{
+   fn clone(&self) -> Box<dyn Storage>
+   {
+       panic!()
+   }
+}
 
 impl BasicStorage for AtomicFile {
     fn commit(&mut self, size: u64) {
@@ -225,17 +231,15 @@ pub trait BasicStorage: Send {
         u64::from_le_bytes(bytes)
     }
 
-    /// Clone. note: provided method panics.
-    fn clone(&self) -> Box<dyn Storage> {
-        panic!()
-    }
-
     /// Wait until current writes are complete.
     fn wait_complete(&self) {}
 }
 
-/// BasicStorage that can be shared between threads.
-pub trait Storage: BasicStorage + Sync {}
+/// BasicStorage with Sync and clone.
+pub trait Storage: BasicStorage + Sync {
+    /// Clone.
+    fn clone(&self) -> Box<dyn Storage>;
+}
 
 /// Simple implementation of [Storage] using `Arc<Mutex<Vec<u8>>`.
 #[derive(Default)]
@@ -250,7 +254,11 @@ impl MemFile {
     }
 }
 
-impl Storage for MemFile {}
+impl Storage for MemFile {
+    fn clone(&self) -> Box<dyn Storage> {
+        Box::new(Self { v: self.v.clone() })
+    }
+}
 
 impl BasicStorage for MemFile {
     fn size(&self) -> u64 {
@@ -281,10 +289,6 @@ impl BasicStorage for MemFile {
     fn commit(&mut self, size: u64) {
         let mut v = self.v.lock().unwrap();
         v.resize(size as usize, 0);
-    }
-
-    fn clone(&self) -> Box<dyn Storage> {
-        Box::new(Self { v: self.v.clone() })
     }
 }
 
@@ -381,7 +385,13 @@ impl SimpleFileStorage {
     }
 }
 
-impl Storage for SimpleFileStorage {}
+impl Storage for SimpleFileStorage {
+    fn clone(&self) -> Box<dyn Storage> {
+        Box::new(Self {
+            file: self.file.clone(),
+        })
+    }
+}
 
 impl BasicStorage for SimpleFileStorage {
     fn size(&self) -> u64 {
@@ -399,23 +409,16 @@ impl BasicStorage for SimpleFileStorage {
     fn commit(&mut self, size: u64) {
         self.file.lock().unwrap().commit(size);
     }
-
-    fn clone(&self) -> Box<dyn Storage> {
-        Box::new(Self {
-            file: self.file.clone(),
-        })
-    }
 }
 
 /// Alternative to SimpleFileStorage that uses multiple [SimpleFileStorage]s to allow parallel reads by different threads.
-#[allow(clippy::vec_box)]
-pub struct MultiFileStorage {
+pub struct AnyFileStorage {
     filename: String,
     files: Arc<Mutex<Vec<FileInner>>>,
 }
 
-impl MultiFileStorage {
-    /// Create new MultiFileStorage.
+impl AnyFileStorage {
+    /// Create new.
     pub fn new(filename: &str) -> Box<Self> {
         Box::new(Self {
             filename: filename.to_owned(),
@@ -435,9 +438,16 @@ impl MultiFileStorage {
     }
 }
 
-impl Storage for MultiFileStorage {}
+impl Storage for AnyFileStorage {
+     fn clone(&self) -> Box<dyn Storage> {
+        Box::new(Self {
+            filename: self.filename.clone(),
+            files: self.files.clone(),
+        })
+    }
+}
 
-impl BasicStorage for MultiFileStorage {
+impl BasicStorage for AnyFileStorage {
     fn size(&self) -> u64 {
         let mut f = self.get_file();
         let result = f.size();
@@ -462,13 +472,6 @@ impl BasicStorage for MultiFileStorage {
         f.commit(size);
         self.put_file(f);
     }
-
-    fn clone(&self) -> Box<dyn Storage> {
-        Box::new(Self {
-            filename: self.filename.clone(),
-            files: self.files.clone(),
-        })
-    }
 }
 
 /// Dummy Stg that can be used for Atomic upd file if "reliable" atomic commits are not required.
@@ -480,7 +483,11 @@ impl DummyFile {
     }
 }
 
-impl Storage for DummyFile {}
+impl Storage for DummyFile {
+    fn clone(&self) -> Box<dyn Storage> {
+        Self::new()
+    }
+}
 
 impl BasicStorage for DummyFile {
     fn size(&self) -> u64 {
@@ -492,10 +499,6 @@ impl BasicStorage for DummyFile {
     fn write(&mut self, _off: u64, _bytes: &[u8]) {}
 
     fn commit(&mut self, _size: u64) {}
-
-    fn clone(&self) -> Box<dyn Storage> {
-        Self::new()
-    }
 }
 
 /// Memory configuration limits.
@@ -1012,6 +1015,150 @@ impl BasicStorage for BasicAtomicFile {
         self.write_data(start, d, 0, len);
     }
 }
+    
+/// Optimized implementation of [Storage] ( unix only ). 
+#[cfg(target_family = "unix")]
+pub struct UnixFileStorage
+{
+    size: Arc<Mutex<u64>>,
+    f: fs::File,
+}
+#[cfg(target_family = "unix")]
+impl UnixFileStorage
+{
+    /// Construct from filename.
+    pub fn new(filename: &str) -> Box<Self>
+    {
+        let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(filename)
+                .unwrap();
+        let size = f.seek(SeekFrom::End(0)).unwrap();
+        let size = Arc::new(Mutex::new(size));
+        Box::new(Self{ size, f })
+    }
+}
+
+#[cfg(target_family = "unix")]
+impl Storage for UnixFileStorage {
+    fn clone(&self) -> Box<dyn Storage> {
+        Box::new(Self {
+            size: self.size.clone(),
+            f: self.f.try_clone().unwrap()
+        })
+    }
+}
+
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::FileExt;
+
+#[cfg(target_family = "unix")]
+impl BasicStorage for UnixFileStorage
+{
+    fn read(&self, start: u64, data: &mut [u8])
+    {
+        
+        let _ = self.f.read_at(data, start );
+    }
+
+    fn write(&mut self, start: u64, data: &[u8])
+    {
+        
+        let _ = self.f.write_at(data, start );
+    }
+
+    fn size(&self) -> u64 {
+        *self.size.lock().unwrap()
+    }
+
+    fn commit(&mut self, size: u64)
+    {
+        *self.size.lock().unwrap() = size;
+        self.f.set_len(size).unwrap();
+        self.f.sync_all().unwrap();
+    }
+}
+
+/// Optimized implementation of [Storage] ( windows only ). 
+#[cfg(target_family = "windows")]
+pub struct WindowsFileStorage
+{
+    size: Arc<Mutex<u64>>,
+    f: fs::File,
+}
+#[cfg(target_family = "windows")]
+impl WindowsFileStorage
+{
+    /// Construct from filename.
+    pub fn new(filename: &str) -> Box<Self>
+    {
+        let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(filename)
+                .unwrap();
+        let size = f.seek(SeekFrom::End(0)).unwrap();
+        let size = Arc::new(Mutex::new(size));
+        Box::new(Self{ size, f })
+    }
+}
+
+#[cfg(target_family = "windows")]
+impl Storage for WindowsFileStorage {
+    fn clone(&self) -> Box<dyn Storage> {
+        Box::new(Self {
+            size: self.size.clone(),
+            f: self.f.try_clone().unwrap()
+        })
+    }
+}
+
+#[cfg(target_family = "windows")]
+use std::os::windows::fs::FileExt;
+
+#[cfg(target_family = "windows")]
+impl BasicStorage for WindowsFileStorage
+{
+    fn read(&self, start: u64, data: &mut [u8])
+    {
+        
+        let _ = self.f.seek_read(data, start );
+    }
+
+    fn write(&mut self, start: u64, data: &[u8])
+    {
+        
+        let _ = self.f.seek_write(data, start );
+    }
+
+    fn size(&self) -> u64 {
+        *self.size.lock().unwrap()
+    }
+
+    fn commit(&mut self, size: u64)
+    {
+        *self.size.lock().unwrap() = size;
+        self.f.set_len(size).unwrap();
+        self.f.sync_all().unwrap();
+    }
+}
+
+/// Optimised Storage
+#[cfg(target_family = "windows")]
+pub type MultiFileStorage = WindowsFileStorage;
+
+/// Optimised Storage
+#[cfg(target_family = "unix")]
+pub type MultiFileStorage = UnixFileStorage;
+
+/// Optimised Storage
+#[cfg(not(any(target_family = "unix",target_family = "windows")))]
+pub type MultiFileStorage = AnyFileStorage;
 
 #[cfg(test)]
 /// Get amount of testing from environment variable TA.

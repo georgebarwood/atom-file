@@ -5,6 +5,12 @@
 //! [`MultiFileStorage`] is the recommended backing storage for AtomicFile.
 //!
 //! [`FastFileStorage`] is the recommended temporary storage for AtomicFile.
+//!
+//!# Features
+//!
+//! This crate supports the following cargo features:
+//! - `pstd` : Use pstd crate for `BTreeMap` (allocated in `GTemp`).
+//! - `unsafe-optim` : Enable unsafe optimisations in release mode.
 
 #![deny(missing_docs)]
 
@@ -14,9 +20,21 @@ use std::cmp::min;
 use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg(feature = "pstd")]
-use pstd::collections::BTreeMap;
+use pstd::{
+    VecA,
+    collections::{BTreeMapA, btree_map::CustomTuning},
+    localalloc::GTemp,
+    veca as gvec,
+};
+
 #[cfg(not(feature = "pstd"))]
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, vec as gvec, vec::Vec as GVec};
+
+#[cfg(feature = "pstd")]
+type BTreeMap<K, V> = BTreeMapA<K, V, CustomTuning<GTemp>>;
+
+#[cfg(feature = "pstd")]
+type GVec<T> = VecA<T, GTemp>;
 
 /// ```Arc<Vec<u8>>```
 pub type Data = Arc<Vec<u8>>;
@@ -756,9 +774,9 @@ impl WMap {
     }
 
     /// Take the map and convert it to a Vec.
-    pub fn convert_to_vec(&mut self) -> Vec<(u64, DataSlice)> {
+    pub fn convert_to_vec(&mut self) -> GVec<(u64, DataSlice)> {
         let map = std::mem::take(&mut self.map);
-        let mut result = Vec::with_capacity(map.len());
+        let mut result = GVec::with_capacity(map.len());
         for (end, v) in map {
             let start = end - v.len as u64;
             result.push((start, v));
@@ -904,7 +922,7 @@ pub struct BasicAtomicFile {
     /// Map of writes.
     map: WMap,
     /// List of writes.
-    list: Vec<(u64, DataSlice)>,
+    list: GVec<(u64, DataSlice)>,
     size: u64,
 }
 
@@ -916,7 +934,7 @@ impl BasicAtomicFile {
             stg: WriteBuffer::new(stg, lim.swbuf),
             upd: WriteBuffer::new(upd, lim.uwbuf),
             map: WMap::default(),
-            list: Vec::new(),
+            list: GVec::new(),
             size,
         });
         result.init();
@@ -937,7 +955,7 @@ impl BasicAtomicFile {
             pos += 8;
             let len = self.upd.stg.read_u64(pos);
             pos += 8;
-            let mut buf = vec![0; len as usize];
+            let mut buf: GVec<u8> = gvec![0; len as usize];
             self.upd.stg.read(pos, &mut buf);
             pos += len;
             self.stg.write(start, &buf);
@@ -994,7 +1012,7 @@ impl BasicAtomicFile {
                     self.stg.write(*start, v.all());
                 }
             }
-            self.list.clear();
+            self.list = GVec::new();
             self.stg.commit(size);
             self.upd.commit(0);
         }

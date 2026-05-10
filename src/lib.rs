@@ -64,7 +64,7 @@ pub struct AtomicFile {
     size: u64,
     /// For sending update maps to be saved.
     tx: std::sync::mpsc::Sender<(u64, WMap)>,
-    /// Held by update process while it is active. Value is set to true on program termination.
+    /// Held by update process while it is active.
     busy: Arc<Mutex<()>>,
     /// Limit on size of CommitFile map.
     map_lim: usize,

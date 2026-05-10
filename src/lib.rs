@@ -128,15 +128,24 @@ impl BasicStorage for AtomicFile {
             self.wait_complete();
         }
         let map = std::mem::take(&mut self.map);
-        let cf = &mut *self.cf.write().unwrap();
-        if cf.stop {
-            return;
-        } // Do not start new commit on program termination.
-        cf.todo += 1;
-        // Apply map of updates to CommitFile.
-        map.to_storage(cf);
-        // Send map of updates to thread to be written to underlying storage.
-        self.tx.send((size, map)).unwrap();
+        let stop =
+        {
+            let cf = &mut *self.cf.write().unwrap();
+            if cf.stop { true }
+            else
+            {
+                cf.todo += 1;
+                // Apply map of updates to CommitFile.
+                map.to_storage(cf);
+                // Send map of updates to thread to be written to underlying storage.
+                self.tx.send((size, map)).unwrap();
+                false
+            }
+        };
+        while stop {
+            // Program is terminating, loop forever.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     fn size(&self) -> u64 {
@@ -158,17 +167,18 @@ impl BasicStorage for AtomicFile {
     }
 
     fn wait_complete(&self) {
-        while self.cf.read().unwrap().busy() {
-            let _x = self.busy.lock();
-        }
-    }
+       while self.cf.read().unwrap().busy()
+       {
+           let _x = self.busy.lock();
+       }
+    }   
 
     fn shutdown(&mut self) {
         self.cf.write().unwrap().stop = true; // Prevents new commits from being added.
         while self.cf.read().unwrap().todo != 0 {
-            let _x = self.busy.lock();
-        }
-    }
+           let _x = self.busy.lock();
+       }
+    }       
 }
 
 struct CommitFile {
@@ -200,7 +210,8 @@ impl CommitFile {
         }
     }
 
-    fn busy(&self) -> bool {
+    fn busy(&self) -> bool
+    {
         self.todo != 0 || self.stop
     }
 }
@@ -269,10 +280,10 @@ pub trait BasicStorage: Send {
     }
 
     /// Wait until current writes are complete.
-    fn wait_complete(&self) {}
+    fn wait_complete(&self){}
 
     /// Called on program termination.
-    fn shutdown(&mut self) {}
+    fn shutdown(&mut self){}
 }
 
 /// BasicStorage with Sync and clone.
@@ -1043,9 +1054,7 @@ impl BasicAtomicFile {
 
 impl BasicStorage for BasicAtomicFile {
     fn commit(&mut self, size: u64) {
-        if self.stop {
-            return;
-        }
+        if self.stop { return; }
         self.commit_phase(size, 1);
         self.commit_phase(size, 2);
         self.size = size;
@@ -1069,7 +1078,8 @@ impl BasicStorage for BasicAtomicFile {
         self.write_data(start, d, 0, len);
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self)
+    {
         self.stop = true;
     }
 }
